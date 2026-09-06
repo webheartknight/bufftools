@@ -114,6 +114,8 @@ local Config = {
   PRECISION_DUR = 60,
   PRECISION_ICON = "rbxassetid://8172818074",
   BEAM_MAX_DIST = 320,
+  XF_HUD_DIST = 56,
+  XF_HUD_MAX = 8,
   SAVE_FILE = "bufftools_pos.json",
   FLAME_SIG_FILE = "bufftools_flames.json",
   PETAL_FALLBACK = true,
@@ -1095,31 +1097,27 @@ local function readAll()
   local life = Config.FLAME_LIFETIME * (fuelLeft and Config.FUEL_MULT or 1)
   local root = char and char:FindFirstChild("HumanoidRootPart")
   local nowBurst = nowClock < xfBurstUntil
-  local list = {}
-  for _, part in ipairs(allFlameParts()) do
-    local dist = root and (part.Position - root.Position).Magnitude or 9999
-    local nm = tostring(part.Name):lower()
-    local namedXf = nm:find("xflame", 1, true) or nm:find("x-flame", 1, true) or nm:find("cross", 1, true)
-    if not xfTagged[part] and (nowBurst or namedXf) then
-      xfTagged[part] = nowClock
-    end
-    if dist <= Config.FLAME_RADIUS and isOwnFlame(part) then
-      if not flameFirstSeen[part] then flameFirstSeen[part] = nowClock end
-      local remain = life - (nowClock - flameFirstSeen[part])
-      if remain > 0 then
-        list[#list + 1] = { remain = remain, dist = dist }
+  local folder = getFlameFolder()
+  if root and folder and (nowBurst or next(xfTagged) ~= nil) then
+    local origin = root.Position
+    for _, ch in ipairs(folder:GetChildren()) do
+      if ch:IsA("BasePart") then
+        local dist = (ch.Position - origin).Magnitude
+        if dist <= Config.XF_HUD_DIST then
+          local nm = string.lower(ch.Name)
+          local namedXf = string.find(nm, "xflame", 1, true) or string.find(nm, "x-flame", 1, true) or string.find(nm, "cross", 1, true)
+          if not xfTagged[ch] and (nowBurst or namedXf) then
+            xfTagged[ch] = nowClock
+          end
+        end
       end
     end
   end
-  for part in pairs(flameFirstSeen) do
-    if not part.Parent then flameFirstSeen[part] = nil end
+  for part, born in pairs(xfTagged) do
+    if not part.Parent or (nowClock - born) > (life + 0.4) then
+      xfTagged[part] = nil
+    end
   end
-  for part in pairs(xfTagged) do
-    if not part.Parent then xfTagged[part] = nil end
-  end
-  table.sort(list, function(a, b) return a.dist < b.dist end)
-  Data.flames.count = #list
-  Data.flames.nearest = list[1]
 
   for id, t in pairs(Tokens) do
     if t.expires < nowTime then Tokens[id] = nil end
@@ -1680,60 +1678,101 @@ beamsOn = true
 
 local allHidden = false
 local xfHud = {}
-local function updateXfFieldHud()
-  local life = Config.FLAME_LIFETIME * (buffLeft("Flame Fuel") and Config.FUEL_MULT or 1)
+local xfHudFree = {}
+local lastXfHudAt = 0
+local lastXfHudText = {}
+
+local function acquireXfHud(part)
+  local hud = table.remove(xfHudFree)
+  if not hud then
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "BTXfTimer"
+    bb.Size = UDim2.fromOffset(48, 20)
+    bb.StudsOffset = Vector3.new(0, 2.2, 0)
+    bb.AlwaysOnTop = true
+    bb.MaxDistance = Config.XF_HUD_DIST + 12
+    local lab = Instance.new("TextLabel")
+    lab.Size = UDim2.fromScale(1, 1)
+    lab.BackgroundTransparency = 1
+    lab.Font = Enum.Font.GothamBold
+    lab.TextSize = 14
+    lab.TextColor3 = Color3.fromRGB(255, 92, 48)
+    lab.TextStrokeTransparency = 0.35
+    lab.TextStrokeColor3 = Color3.fromRGB(20, 4, 8)
+    lab.Parent = bb
+    hud = { bb = bb, lab = lab }
+  end
+  hud.bb.Adornee = part
+  hud.bb.Parent = beamFolder
+  hud.bb.Enabled = true
+  return hud
+end
+
+local function releaseXfHud(hud)
+  hud.bb.Enabled = false
+  hud.bb.Adornee = nil
+  hud.bb.Parent = nil
+  xfHudFree[#xfHudFree + 1] = hud
+end
+
+local function updateXfFieldHud(root)
   local nowC = os.clock()
+  if nowC - lastXfHudAt < 0.12 then return end
+  lastXfHudAt = nowC
+  local life = Config.FLAME_LIFETIME * (buffLeft("Flame Fuel") and Config.FUEL_MULT or 1)
   local seen = {}
-  if not allHidden then
+  if not allHidden and root then
+    local origin = root.Position
+    local ranked = {}
     for part, born in pairs(xfTagged) do
       if part.Parent then
         local remain = life - (nowC - born)
-        if remain > 0 then
-          seen[part] = true
-          local hud = xfHud[part]
-          if not hud then
-            local bb = Instance.new("BillboardGui")
-            bb.Name = "BTXfTimer"
-            bb.Size = UDim2.fromOffset(56, 24)
-            bb.StudsOffset = Vector3.new(0, 2.4, 0)
-            bb.AlwaysOnTop = true
-            bb.MaxDistance = 180
-            bb.Parent = part
-            local lab = Instance.new("TextLabel")
-            lab.Size = UDim2.fromScale(1, 1)
-            lab.BackgroundTransparency = 1
-            lab.Font = Enum.Font.GothamBlack
-            lab.TextSize = 16
-            lab.TextColor3 = Color3.fromRGB(255, 92, 48)
-            lab.Parent = bb
-            addStroke(lab)
-            hud = { bb = bb, lab = lab }
-            xfHud[part] = hud
-          end
-          hud.lab.Text = string.format("%.1fs", remain)
-          hud.bb.Enabled = true
+        local dist = (part.Position - origin).Magnitude
+        if remain > 0 and dist <= Config.XF_HUD_DIST then
+          ranked[#ranked + 1] = { part = part, remain = remain, dist = dist }
         end
+      end
+    end
+    if #ranked > 1 then
+      table.sort(ranked, function(a, b) return a.dist < b.dist end)
+    end
+    local cap = math.min(#ranked, Config.XF_HUD_MAX)
+    for i = 1, cap do
+      local item = ranked[i]
+      local part = item.part
+      seen[part] = true
+      local hud = xfHud[part]
+      if not hud then
+        hud = acquireXfHud(part)
+        xfHud[part] = hud
+      else
+        hud.bb.Adornee = part
+      end
+      local txt = string.format("%.1fs", item.remain)
+      if lastXfHudText[part] ~= txt then
+        lastXfHudText[part] = txt
+        hud.lab.Text = txt
       end
     end
   end
   for part, hud in pairs(xfHud) do
     if not seen[part] then
-      pcall(function() hud.bb:Destroy() end)
+      releaseXfHud(hud)
       xfHud[part] = nil
+      lastXfHudText[part] = nil
     end
   end
 end
 
 RunService.Heartbeat:Connect(function()
   pcall(function()
+    local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
     if not beamsOn or next(Tokens) == nil then
       if VisibleBeams ~= 0 then
         for _, bm in pairs(beamPool) do setBeamVisible(bm, false) end
         VisibleBeams = 0
       end
-    else
-    local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    if root then
+    elseif root then
     local nowT = os.time()
     local seen = {}
     local visCount = 0
@@ -1754,8 +1793,6 @@ RunService.Heartbeat:Connect(function()
             destroyBeam(bm)
             bm = makeWorldBeam(BEAM_COLORS[kind] or Theme.accent, kind, info.icon, info.morphName)
             beamPool[id] = bm
-          elseif bm.face then
-            bm.face.Image = packIconForKind(kind, info.icon, info.morphName)
           end
           bm.holder.CFrame = CFrame.new(pos)
           local left = 0
@@ -1782,8 +1819,7 @@ RunService.Heartbeat:Connect(function()
     end
     VisibleBeams = visCount
     end
-    end
-    updateXfFieldHud()
+    if root then updateXfFieldHud(root) end
   end)
 end)
 
