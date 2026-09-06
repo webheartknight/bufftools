@@ -1,0 +1,1911 @@
+--[[
+  BUFFTOOLS v2.7 — Bee Swarm Simulator (Potassium) · PERFORMANCE BUILD · RED HIVE
+
+  Removed: Debug tab, Remotes live monitor, halo/cosmetics, all
+  per-event logging. Nothing extra on screen — tiles + BT button.
+
+  Performance fixes (this is what caused the freezes):
+  * GC scan used to run every 2.5s over millions of objects. Now it
+    runs only during a short "learning phase": every 5s for the
+    first 60s, and stops early as soon as token icons and counter
+    calibration are learned. After that it never runs again unless
+    something is still missing (then a rare 20s scan until learned).
+    Scan cap lowered from 2.5M to 800K objects.
+  * Flames no longer need GC at all after the learning phase -
+    they are read from the Workspace.PlayerFlames folder (cached).
+  * PlayerActivesGui reference is cached; Precision icon scan runs
+    every 1.5s on that one gui only, and is skipped entirely while
+    the ServerBuffEvent stream already provides Precision.
+  * Beam loop returns early when there are no tokens.
+
+  Everything else unchanged: tiles "10/10 · 45s", X-Flame and
+  Scorching token counters (no cooldowns), morphs x1-x4 with
+  timer, Red Petals, robust beam binding (3-layer icon
+  recognition + reclassification), own-flame learning, RShift.
+]]
+
+local function btFatal(err)
+  pcall(function()
+    local NL2 = string.char(10)
+    local Players2 = game:GetService("Players")
+    local pl = Players2.LocalPlayer or Players2.PlayerAdded:Wait()
+    local pg = pl:WaitForChild("PlayerGui")
+    local g = Instance.new("ScreenGui")
+    g.Name = "BuffToolsFatal"
+    g.ResetOnSpawn = false
+    g.IgnoreGuiInset = true
+    if syn and syn.protect_gui then pcall(function() syn.protect_gui(g) end) end
+    g.Parent = pg
+    local f = Instance.new("Frame")
+    f.Size = UDim2.fromOffset(470, 220)
+    f.Position = UDim2.fromScale(0.5, 0.28)
+    f.AnchorPoint = Vector2.new(0.5, 0)
+    f.BackgroundColor3 = Color3.fromRGB(12, 4, 10)
+    f.BorderSizePixel = 0
+    f.ZIndex = 50
+    f.Parent = g
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
+    local st = Instance.new("UIStroke", f)
+    st.Color = Color3.fromRGB(140, 70, 220)
+    st.Thickness = 2
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -20, 0, 26)
+    t.Position = UDim2.new(0, 10, 0, 8)
+    t.BackgroundTransparency = 1
+    t.Text = "BUFFTOOLS: INJECT ERROR - send me this text"
+    t.TextColor3 = Color3.fromRGB(255, 110, 130)
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 13
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.ZIndex = 51
+    t.Parent = f
+    local tb = Instance.new("TextBox")
+    tb.Size = UDim2.new(1, -20, 1, -78)
+    tb.Position = UDim2.new(0, 10, 0, 38)
+    tb.BackgroundColor3 = Color3.fromRGB(8, 2, 8)
+    tb.Text = tostring(err)
+    tb.TextColor3 = Color3.fromRGB(245, 220, 235)
+    tb.Font = Enum.Font.Code
+    tb.TextSize = 11
+    tb.TextXAlignment = Enum.TextXAlignment.Left
+    tb.TextYAlignment = Enum.TextYAlignment.Top
+    tb.MultiLine = true
+    tb.TextWrapped = true
+    tb.ClearTextOnFocus = false
+    tb.BorderSizePixel = 0
+    tb.ZIndex = 51
+    tb.Parent = f
+    Instance.new("UICorner", tb).CornerRadius = UDim.new(0, 6)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(150, 24)
+    b.Position = UDim2.new(0, 10, 1, -32)
+    b.BackgroundColor3 = Color3.fromRGB(220, 40, 55)
+    b.Text = "Copy error"
+    b.TextColor3 = Color3.fromRGB(245, 236, 245)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.BorderSizePixel = 0
+    b.ZIndex = 51
+    b.Parent = f
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(function()
+      pcall(function() setclipboard("BuffTools fatal:" .. NL2 .. tostring(err)) end)
+      b.Text = "Copied!"
+    end)
+  end)
+  print("[BuffTools] FATAL:", err)
+end
+
+local btOk, btErr = pcall(function()
+
+-- ================= CONFIG =================
+local Config = {
+  FLAME_LIFETIME = 4,
+  FUEL_MULT = 1.5,
+  FLAME_RADIUS = 40,
+  POLL_INTERVAL = 0.3,
+  GUI_SCAN_INTERVAL = 1.5,
+  LEARN_PHASE_TIME = 60,
+  LEARN_SCAN_INTERVAL = 5,
+  SLOW_SCAN_INTERVAL = 20,
+  GC_SCAN_CAP = 800000,
+  SCORCH_MAX = 30,
+  XFLAME_MAX = 25,
+  PRECISION_DUR = 60,
+  PRECISION_ICON = "rbxassetid://8172818074",
+  BEAM_MAX_DIST = 320,
+  SAVE_FILE = "bufftools_pos.json",
+  FLAME_SIG_FILE = "bufftools_flames.json",
+  PETAL_FALLBACK = true,
+}
+
+-- known token icon IDs (numeric), from recon + hardcoded fallback
+local KNOWN_MORPH_ICONS = {
+  ["1472580249"] = "Panda Bear Morph",
+  ["1472532912"] = "Polar Bear Morph",
+  ["1472491940"] = "Black Bear Morph",
+  ["1472425802"] = "Brown Bear Morph",
+  ["2032949183"] = "Mother Bear Morph",
+  ["1489734171"] = "Science Bear Morph",
+}
+local KNOWN_INSPIRE_ID = "2000457501"
+local KNOWN_BABY_ID = "1472256444"
+local KNOWN_LINK_ID = "1629547638"
+
+-- ================= CORE =================
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local NL = string.char(10)
+
+local function log(...) print("[BuffTools]", ...) end
+
+local function currentCamera()
+  return Workspace.CurrentCamera
+end
+
+local canDraw = false
+pcall(function()
+  local t = Drawing.new("Line")
+  t:Remove()
+  canDraw = true
+end)
+local canSave = pcall(function() return isfile end) and type(isfile) == "function"
+
+-- normalize any icon URL to its trailing numeric asset id
+local function iconId(icon)
+  if type(icon) == "number" then
+    return tostring(math.floor(icon))
+  end
+  if type(icon) ~= "string" then return nil end
+  return icon:match("(%d+)$")
+end
+
+-- Red Hive palette
+local Theme = {
+  bg = Color3.fromRGB(8, 2, 8),
+  panel = Color3.fromRGB(12, 4, 10),
+  header = Color3.fromRGB(18, 6, 16),
+  btn = Color3.fromRGB(28, 8, 22),
+  stroke = Color3.fromRGB(140, 70, 220),
+  accent = Color3.fromRGB(220, 40, 55),
+  text = Color3.fromRGB(245, 236, 245),
+  muted = Color3.fromRGB(168, 140, 190),
+  dim = Color3.fromRGB(110, 88, 130),
+  ok = Color3.fromRGB(176, 120, 255),
+  warn = Color3.fromRGB(255, 110, 130),
+  hot = Color3.fromRGB(255, 210, 140),
+}
+
+-- PNG names from pack. Downloaded from GitHub into executor cache, then getcustomasset.
+local ICON_CACHE_DIR = "BuffTools/icons/"
+local ICON_REMOTE_BASES = {
+  "https://cdn.jsdelivr.net/gh/webheartknight/bufftools@main/icons/",
+  "https://raw.githubusercontent.com/webheartknight/bufftools/main/icons/",
+}
+local ICON_PREFIXES = {
+  ICON_CACHE_DIR,
+  "BuffTools/icons\\",
+  "pack icons bss/",
+  "pack icons bss\\",
+  "",
+}
+
+local PACK = {
+  inspire = "Inspire Token.png",
+  baby = "Baby Love.png",
+  link = "Token Link.png",
+  scorch = "Scorching Star.png",
+  xflame = "X-Flame.png",
+  petals = "Red Petals.png",
+  flame = "Flame.png",
+  precision = "Precision.png",
+  panda = "Panda Bear Morph.png",
+  polar = "Polar Bear Morph.png",
+  black = "Black Bear Morph.png",
+  brown = "Brown Bear Morph.png",
+  mother = "Mother Bear Morph.png",
+  science = "Science Bear Morph.png",
+  mask = "DemonMask.png",
+}
+
+local function rbxUrl(id)
+  if type(id) ~= "string" or id == "" then return "" end
+  if id:find("rbxasset", 1, true) then return id end
+  return "rbxassetid://" .. id
+end
+
+local customAssetCache = {}
+
+local function pngMagicOk(body)
+  return type(body) == "string" and #body > 64 and body:sub(1, 4) == "\137PNG"
+end
+
+local function httpGetBody(url)
+  local req = (syn and syn.request) or http_request or request or (http and http.request)
+  if req then
+    local ok, res = pcall(req, { Url = url, Method = "GET" })
+    if ok and type(res) == "table" then
+      local body = res.Body or res.body
+      local code = tonumber(res.StatusCode or res.status_code or res.Status)
+      if pngMagicOk(body) and (not code or code == 200) then
+        return body
+      end
+    end
+  end
+  local ok2, body2 = pcall(function()
+    return game:HttpGet(url)
+  end)
+  if ok2 and pngMagicOk(body2) then
+    return body2
+  end
+  return nil
+end
+
+local function fetchPackPng(filename)
+  local enc = filename:gsub(" ", "%%20")
+  for i = 1, #ICON_REMOTE_BASES do
+    local body = httpGetBody(ICON_REMOTE_BASES[i] .. enc)
+    if body then
+      return body
+    end
+  end
+  return nil
+end
+
+local function ensureIconCacheDir()
+  if type(makefolder) == "function" then
+    pcall(makefolder, "BuffTools")
+    pcall(makefolder, "BuffTools/icons")
+  end
+end
+
+local function tryCustom(path)
+  if type(getcustomasset) ~= "function" then
+    return nil
+  end
+  local ok, res = pcall(getcustomasset, path)
+  if ok and type(res) == "string" and res ~= "" then
+    return res
+  end
+  return nil
+end
+
+local function btAsset(filename, rbxFallback)
+  if type(filename) == "string" and filename ~= "" then
+    local cached = customAssetCache[filename]
+    if type(cached) == "string" then
+      return cached
+    end
+    for i = 1, #ICON_PREFIXES do
+      local res = tryCustom(ICON_PREFIXES[i] .. filename)
+      if res then
+        customAssetCache[filename] = res
+        return res
+      end
+    end
+    if type(isfile) ~= "function" or not isfile(ICON_CACHE_DIR .. filename) then
+      local body = fetchPackPng(filename)
+      if body then
+        ensureIconCacheDir()
+        pcall(function()
+          writefile(ICON_CACHE_DIR .. filename, body)
+        end)
+      end
+    end
+    local res = tryCustom(ICON_CACHE_DIR .. filename)
+    if res then
+      customAssetCache[filename] = res
+      return res
+    end
+  end
+  return rbxUrl(rbxFallback)
+end
+
+local BEAM_KIND_BY_NAME = {
+  ["Baby Love"] = "baby",
+  ["Inspire"] = "inspire",
+  ["Token Link"] = "link",
+  ["Brown Bear Morph"] = "morph",
+  ["Black Bear Morph"] = "morph",
+  ["Science Bear Morph"] = "morph",
+  ["Mother Bear Morph"] = "morph",
+  ["Panda Bear Morph"] = "morph",
+  ["Polar Bear Morph"] = "morph",
+}
+
+local function normalizeTokenName(name)
+  if type(name) ~= "string" or name == "" then return nil end
+  local n = name:gsub("^%s+", ""):gsub("%s+$", "")
+  n = n:gsub("%s+[Tt]oken%s*$", "")
+  return n
+end
+
+local function kindFromName(name)
+  if type(name) ~= "string" or name == "" then return nil, nil end
+  local n = normalizeTokenName(name)
+  if not n then return nil, nil end
+  local kind = BEAM_KIND_BY_NAME[n]
+  if kind then
+    return kind, (kind == "morph") and n or nil
+  end
+  local compact = n:lower():gsub("[%s%p_]", "")
+  if compact == "tokenlink" or compact == "linktoken" then return "link", nil end
+  if compact == "babylove" then return "baby", nil end
+  if compact == "inspire" or compact == "inspiretoken" then return "inspire", nil end
+  if compact:find("morph", 1, true) then
+    local keys = { "panda", "polar", "science", "mother", "black", "brown" }
+    local pretty = {
+      panda = "Panda Bear Morph",
+      polar = "Polar Bear Morph",
+      science = "Science Bear Morph",
+      mother = "Mother Bear Morph",
+      black = "Black Bear Morph",
+      brown = "Brown Bear Morph",
+    }
+    for i = 1, #keys do
+      if compact:find(keys[i], 1, true) then
+        return "morph", pretty[keys[i]]
+      end
+    end
+  end
+  return nil, nil
+end
+
+local function morphFileFromName(name)
+  if type(name) ~= "string" then return PACK.panda end
+  local low = name:lower()
+  if low:find("panda", 1, true) then return PACK.panda end
+  if low:find("polar", 1, true) then return PACK.polar end
+  if low:find("science", 1, true) then return PACK.science end
+  if low:find("mother", 1, true) then return PACK.mother end
+  if low:find("black", 1, true) then return PACK.black end
+  if low:find("brown", 1, true) then return PACK.brown end
+  return PACK.panda
+end
+
+local function packIconForKind(kind, tokenIcon, morphHint)
+  if kind == "inspire" then return btAsset(PACK.inspire, KNOWN_INSPIRE_ID) end
+  if kind == "baby" then return btAsset(PACK.baby, KNOWN_BABY_ID) end
+  if kind == "morph" then return btAsset(morphFileFromName(morphHint), "1472580249") end
+  if kind == "link" then return btAsset(PACK.link, KNOWN_LINK_ID) end
+  return ""
+end
+
+for _, filename in pairs(PACK) do
+  pcall(btAsset, filename, nil)
+end
+
+-- ================= STATE =================
+local Buffs = {}
+local Counters = { scorch = nil, xflame = nil }
+local Tokens = {}
+local MorphIcons = {}
+local IconMap = { inspire = nil, baby = nil, precision = nil, link = nil }
+
+local function rememberBeamIcon(name, icon)
+  local kind, morphName = kindFromName(name)
+  local id = iconId(icon)
+  if not kind or not id then return kind, morphName end
+  if kind == "morph" then
+    MorphIcons[id] = morphName
+  elseif kind == "inspire" then
+    IconMap.inspire = id
+  elseif kind == "baby" then
+    IconMap.baby = id
+  elseif kind == "link" then
+    IconMap.link = id
+  end
+  return kind, morphName
+end
+local MorphTrack = { spawns = {}, lastSpawn = nil, avgInterval = nil }
+local flameFirstSeen = {}
+local flameParts = {}
+local xfBurstUntil = 0
+local xfTagged = {}
+local xfPrevUntil = nil
+local Streams = { buff = false, ability = false, collectible = false, tokens = false }
+local VisibleBeams = 0
+local GuiPrecisionStatus = "not scanned"
+local guiScanCount = 0
+local Cumul = {}
+local Calib = {
+  xf = { offset = nil, src = "Battle", confirmed = false },
+  sc = { offset = nil, src = nil, confirmed = false },
+}
+local CounterTrack = {
+  xf = { last = nil, vote = 0, up = true },
+  sc = { last = nil, vote = 0, up = true },
+}
+local beamsOn = false
+
+-- cached references (avoid repeated FindFirstChild chains)
+local cachedPag = nil
+local cachedFlameFolder = nil
+
+local function getFlameFolder()
+  if not cachedFlameFolder or not cachedFlameFolder.Parent then
+    cachedFlameFolder = Workspace:FindFirstChild("PlayerFlames")
+  end
+  return cachedFlameFolder
+end
+
+-- ================= COUNTERS =================
+local function handleCounter(key, t, v, max)
+  if type(v) ~= "number" then return end
+  if t.last then
+    local d = v - t.last
+    local half = max * 0.5
+    if d <= -half then
+      t.up = true
+      t.vote = 3
+      if t == CounterTrack.xf then xfBurstUntil = os.clock() + 1.6 end
+    elseif d >= half then
+      t.up = false
+      t.vote = -3
+    elseif d ~= 0 and math.abs(d) < half then
+      t.vote = t.vote + d
+      if math.abs(t.vote) >= 3 then t.up = t.vote > 0 end
+    end
+  end
+  t.last = v
+end
+
+local function counterUntil(t, v, max)
+  if type(v) ~= "number" then return nil, nil end
+  if t.up then return math.max(0, max - v), v end
+  return math.max(0, v), math.max(0, max - v)
+end
+
+local function calibrate(keyName, value, max, confirmed)
+  local c = Calib[keyName]
+  local srcKey = c.src
+  if keyName == "sc" and not srcKey then
+    srcKey = Cumul["Boost"] and "Boost" or (Cumul["Red Boost"] and "Red Boost" or nil)
+    c.src = srcKey
+  end
+  if not srcKey or type(Cumul[srcKey]) ~= "number" then return false end
+  c.offset = (value - Cumul[srcKey]) % max
+  if confirmed then c.confirmed = true end
+  return true
+end
+
+local function applyDerived(keyName, t, max)
+  local c = Calib[keyName]
+  if not c.offset or not c.src then return end
+  local b = Cumul[c.src]
+  if type(b) ~= "number" then return end
+  local prog = (b + c.offset) % max
+  handleCounter(keyName, t, prog, max)
+  if keyName == "xf" then Counters.xflame = prog else Counters.scorch = prog end
+end
+
+-- ================= TOKEN CLASSIFICATION =================
+local function classifyIcon(icon)
+  local id = iconId(icon)
+  if not id then return nil, nil end
+  if id == KNOWN_LINK_ID or (IconMap.link and id == IconMap.link) then return "link", nil end
+  if id == KNOWN_INSPIRE_ID or (IconMap.inspire and id == IconMap.inspire) then return "inspire", nil end
+  if id == KNOWN_BABY_ID or (IconMap.baby and id == IconMap.baby) then return "baby", nil end
+  local morphName = MorphIcons[id] or KNOWN_MORPH_ICONS[id]
+  if type(morphName) == "string" then return "morph", morphName end
+  return nil, nil
+end
+
+local function recordMorphSpawn()
+  local now = os.clock()
+  if MorphTrack.lastSpawn then
+    local iv = now - MorphTrack.lastSpawn
+    if iv > 5 and iv < 600 then
+      MorphTrack.spawns[#MorphTrack.spawns + 1] = iv
+      if #MorphTrack.spawns > 6 then table.remove(MorphTrack.spawns, 1) end
+      local sum = 0
+      for _, x in ipairs(MorphTrack.spawns) do sum = sum + x end
+      MorphTrack.avgInterval = sum / #MorphTrack.spawns
+    end
+  end
+  MorphTrack.lastSpawn = now
+end
+
+-- ================= REMOTE STREAMS =================
+local function onBuffEvent(action, src, startTime, dur, combo)
+  if type(src) ~= "string" then return end
+  if action == "Remove" then
+    Buffs[src] = nil
+    return
+  end
+  if action == "Apply" or action == "ChangeCombo" or action == "Refresh" then
+    local b = Buffs[src]
+    if not b then
+      b = {}
+      Buffs[src] = b
+    end
+    if type(startTime) == "number" and startTime > 0 then b.start = startTime end
+    if type(dur) == "number" then b.dur = dur end
+    if type(combo) == "number" then b.combo = combo end
+    b.fromSlot = nil
+    b.fromGui = nil
+  end
+end
+
+local function onAbilityEvent(payload)
+  if type(payload) ~= "table" then return end
+  local ss = rawget(payload, "Scorching Star")
+  if type(ss) == "table" and type(rawget(ss, "Values")) == "table" then
+    local v = rawget(ss.Values, 1)
+    if type(v) == "number" then
+      Counters.scorch = v
+      CounterTrack.sc.last = v
+      calibrate("sc", v, Config.SCORCH_MAX, true)
+    end
+  end
+  local xf = rawget(payload, "X-Flame")
+  if type(xf) == "table" and type(rawget(xf, "Values")) == "table" then
+    local v = rawget(xf.Values, 1)
+    if type(v) == "number" then
+      Counters.xflame = v
+      CounterTrack.xf.last = v
+      calibrate("xf", v, Config.XFLAME_MAX, true)
+    end
+  end
+end
+
+local function onCollectibleEvent(action, data)
+  if type(data) ~= "table" then return end
+  if action == "Spawn" then
+    local id = rawget(data, "ID")
+    local pos = rawget(data, "Pos")
+    if id and typeof(pos) == "Vector3" then
+      local icon = rawget(data, "Icon") or rawget(data, "IconId") or rawget(data, "Texture") or rawget(data, "Decal")
+      local nm = rawget(data, "Name") or rawget(data, "Type") or rawget(data, "Ability") or rawget(data, "Token")
+      local kind, morphName = classifyIcon(icon)
+      if not kind then
+        kind, morphName = kindFromName(nm)
+        if kind then rememberBeamIcon(nm, icon) end
+      end
+      local dur = rawget(data, "Dur")
+      local st = rawget(data, "SpawnTime")
+      Tokens[id] = {
+        kind = kind,
+        icon = icon,
+        morphName = morphName,
+        name = nm,
+        counted = false,
+        pos = pos,
+        expires = (type(st) == "number" and st or os.time()) + (type(dur) == "number" and dur or 15),
+      }
+      if kind == "morph" then
+        recordMorphSpawn()
+        Tokens[id].counted = true
+      end
+    end
+  elseif action == "Collect" then
+    local id = rawget(data, "ID")
+    if id then Tokens[id] = nil end
+  end
+end
+
+-- icons are learned over time; re-classify tokens every poll so a
+-- token spawned before its icon was known still gets its beam
+local function reclassifyTokens()
+  for _, tok in pairs(Tokens) do
+    local k, morphName = classifyIcon(tok.icon)
+    if not k then
+      k, morphName = kindFromName(tok.name)
+    end
+    if k then
+      if k ~= tok.kind then
+        tok.kind = k
+        if k == "morph" and not tok.counted then
+          recordMorphSpawn()
+          tok.counted = true
+        end
+      end
+      if morphName then tok.morphName = morphName end
+    elseif tok.kind == "ability" then
+      tok.kind = nil
+    end
+  end
+end
+
+local cachedCollectibles = nil
+local function getCollectiblesFolder()
+  if not cachedCollectibles or not cachedCollectibles.Parent then
+    cachedCollectibles = Workspace:FindFirstChild("Collectibles")
+  end
+  return cachedCollectibles
+end
+
+local function scanWorldTokens()
+  local folder = getCollectiblesFolder()
+  if not folder then return end
+  local seen = {}
+  for _, part in ipairs(folder:GetChildren()) do
+    if part:IsA("BasePart") then
+      local decal = part:FindFirstChildOfClass("Decal")
+      local tex = decal and decal.Texture
+      local kind, morphName = classifyIcon(tex)
+      if not kind then
+        kind, morphName = kindFromName(part.Name)
+        if kind then rememberBeamIcon(part.Name, tex) end
+      end
+      if kind then
+        local key = "w_" .. tostring(part)
+        seen[key] = true
+        local tok = Tokens[key]
+        if not tok then
+          local life = (kind == "link") and 4 or 15
+          Tokens[key] = {
+            kind = kind,
+            icon = tex,
+            morphName = morphName,
+            name = part.Name,
+            counted = kind == "morph",
+            pos = part.Position,
+            expires = os.time() + life,
+            spawnedAt = os.clock(),
+            part = part,
+          }
+          if kind == "morph" then recordMorphSpawn() end
+        else
+          tok.kind = kind
+          tok.morphName = morphName or tok.morphName
+          tok.pos = part.Position
+          tok.part = part
+          local life = (kind == "link") and 4 or 15
+          local born = tok.spawnedAt or os.clock()
+          tok.expires = os.time() + math.max(1, math.ceil(life - (os.clock() - born)))
+        end
+      end
+    end
+  end
+  for id, tok in pairs(Tokens) do
+    if type(id) == "string" and id:sub(1, 2) == "w_" then
+      if not seen[id] or (tok.part and not tok.part.Parent) then
+        Tokens[id] = nil
+      end
+    end
+  end
+end
+
+local function onTokenEvent(payload)
+  if type(payload) ~= "table" then return end
+  pcall(function()
+    for k, v in pairs(payload) do
+      if type(k) == "string" and type(v) == "number" then
+        Cumul[k] = v
+      end
+    end
+  end)
+  applyDerived("xf", CounterTrack.xf, Config.XFLAME_MAX)
+  applyDerived("sc", CounterTrack.sc, Config.SCORCH_MAX)
+end
+
+local function hookStreams()
+  local events = ReplicatedStorage:FindFirstChild("Events")
+  if not events then return end
+  pcall(function()
+    local sbe = events:FindFirstChild("ServerBuffEvent")
+    if sbe and sbe:IsA("RemoteEvent") then
+      sbe.OnClientEvent:Connect(function(...) onBuffEvent(...) end)
+      Streams.buff = true
+    end
+    local pae = events:FindFirstChild("PlayerAbilityEvent")
+    if pae and pae:IsA("RemoteEvent") then
+      pae.OnClientEvent:Connect(function(...) onAbilityEvent(...) end)
+      Streams.ability = true
+    end
+    local ce = events:FindFirstChild("CollectibleEvent")
+    if ce and ce:IsA("RemoteEvent") then
+      ce.OnClientEvent:Connect(function(...)
+        local args = { ... }
+        onCollectibleEvent(args[1], args[2])
+      end)
+      Streams.collectible = true
+    end
+    local ste = events:FindFirstChild("ServerAbilityTokenEvent")
+    if ste and ste:IsA("RemoteEvent") then
+      ste.OnClientEvent:Connect(function(...) onTokenEvent(...) end)
+      Streams.tokens = true
+    end
+  end)
+end
+hookStreams()
+
+-- ================= FLAMES (own-only learning) =================
+local FlameSigs = {}
+
+pcall(function()
+  if canSave and isfile(Config.FLAME_SIG_FILE) then
+    local data = HttpService:JSONDecode(readfile(Config.FLAME_SIG_FILE))
+    if type(data) == "table" then
+      for _, sig in ipairs(data) do
+        if type(sig) == "table" and #sig > 0 then FlameSigs[#FlameSigs + 1] = sig end
+      end
+    end
+  end
+end)
+
+local function saveFlameSigs()
+  if not canSave then return end
+  pcall(function() writefile(Config.FLAME_SIG_FILE, HttpService:JSONEncode(FlameSigs)) end)
+end
+
+local function emitterSig(part)
+  local em = part:FindFirstChild("PF") or part:FindFirstChild("PS")
+  if not em or not em:IsA("ParticleEmitter") then return nil end
+  local ok2, kps = pcall(function()
+    local res = {}
+    for _, kp in ipairs(em.Color.Keypoints) do
+      res[#res + 1] = { kp.Time, kp.Value.R, kp.Value.G, kp.Value.B }
+    end
+    return res
+  end)
+  if ok2 and #kps > 0 then return kps end
+  return nil
+end
+
+local function sigSimilar(a, b)
+  if #a == 0 or #b == 0 then return false end
+  local function close(p, q)
+    return math.abs(p[2] - q[2]) <= 0.13 and math.abs(p[3] - q[3]) <= 0.13 and math.abs(p[4] - q[4]) <= 0.13
+  end
+  return close(a[1], b[1]) and close(a[#a], b[#b])
+end
+
+local function isOwnFlame(part)
+  if #FlameSigs == 0 then return true end
+  local sig = emitterSig(part)
+  if not sig then return true end
+  for _, s in ipairs(FlameSigs) do
+    if sigSimilar(s, sig) then return true end
+  end
+  return false
+end
+
+-- merged flame source: GC-learned registry + live folder contents
+local function allFlameParts()
+  local set, res = {}, {}
+  for _, p in ipairs(flameParts) do
+    if p.Parent and not set[p] then
+      set[p] = true
+      res[#res + 1] = p
+    end
+  end
+  local folder = getFlameFolder()
+  if folder then
+    for _, ch in ipairs(folder:GetChildren()) do
+      if ch:IsA("BasePart") and ch.Parent and not set[ch] then
+        set[ch] = true
+        res[#res + 1] = ch
+      end
+    end
+  end
+  return res
+end
+
+-- ================= PRECISION ICON =================
+local function findStackTextNear(inst)
+  local parent = inst.Parent
+  for depth = 1, 4 do
+    if not parent then break end
+    local best = nil
+    pcall(function()
+      for _, ch in ipairs(parent:GetDescendants()) do
+        if ch:IsA("TextLabel") or ch:IsA("TextButton") or ch:IsA("TextBox") then
+          local num = tostring(ch.Text):match("(%d+)")
+          if num then
+            local nv = tonumber(num)
+            if nv and nv <= 10 and (not best or nv > best) then best = nv end
+          end
+        end
+      end
+    end)
+    if best then return best end
+    parent = parent.Parent
+  end
+  return nil
+end
+
+local function scanForPrecisionIcon(root)
+  local targetId = iconId(IconMap.precision or Config.PRECISION_ICON)
+  if not targetId then return nil, false end
+  local found = nil
+  local iconSeen = false
+  pcall(function()
+    for _, d in ipairs(root:GetDescendants()) do
+      if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+        local okImg, img = pcall(function() return d.Image end)
+        if okImg and iconId(img) == targetId then
+          iconSeen = true
+          local nv = findStackTextNear(d)
+          if nv and (not found or nv > found) then found = nv end
+        end
+      end
+    end
+  end)
+  return found, iconSeen
+end
+
+local function guiScan()
+  -- stream already provides Precision => icon scan not needed
+  local b = Buffs["Precision"]
+  if b and type(b.start) == "number" and not b.fromSlot and not b.fromGui then
+    GuiPrecisionStatus = "stream (scan skipped)"
+    return
+  end
+
+  guiScanCount = guiScanCount + 1
+  local pag = cachedPag
+  if not pag or not pag.Parent then
+    cachedPag = nil
+    local pg = player:FindFirstChild("PlayerGui")
+    local sg = pg and pg:FindFirstChild("ScreenGui")
+    pag = sg and sg:FindFirstChild("PlayerActivesGui")
+    cachedPag = pag
+  end
+  if not pag then
+    GuiPrecisionStatus = "no PlayerActivesGui"
+    return
+  end
+
+  local found, iconSeen = scanForPrecisionIcon(pag)
+  if not iconSeen and guiScanCount % 5 == 0 then
+    local sg = pag.Parent
+    found, iconSeen = scanForPrecisionIcon(sg)
+  end
+
+  if found and found > 0 then
+    if not b then
+      b = {}
+      Buffs["Precision"] = b
+    end
+    b.combo = found
+    b.fromGui = true
+    b.fromSlot = nil
+  else
+    if b and b.fromGui then Buffs["Precision"] = nil end
+  end
+
+  GuiPrecisionStatus = iconSeen and ("icon found, stacks=" .. tostring(found)) or "icon not found"
+end
+
+-- ================= GC SNAPSHOT (learning phase only) =================
+local function essentialsLearned()
+  return next(MorphIcons) ~= nil and IconMap.inspire ~= nil and IconMap.baby ~= nil
+end
+
+local function probeSlotTimer(slot)
+  local bestLeft = nil
+  pcall(function()
+    for k, v in pairs(slot) do
+      if type(k) == "string" and type(v) == "number" then
+        local kl = k:lower()
+        if (kl:find("left") or kl:find("remain")) and v > 0 and v <= 1000 then
+          bestLeft = v
+        elseif (kl:find("end") or kl:find("expire")) and v > 1e9 then
+          local l = v - os.time()
+          if l > 0 and l <= 1000 then bestLeft = l end
+        end
+      end
+    end
+  end)
+  return bestLeft
+end
+
+local function gcScan()
+  local gc
+  local ok2 = pcall(function() gc = getgc(true) end)
+  if not ok2 or type(gc) ~= "table" then return end
+  local now = os.time()
+  local newFlames, flameSet = {}, {}
+  local seenPrecisionSlot = false
+  local regXf, regSc = nil, nil
+  local n = 0
+  for _, obj in ipairs(gc) do
+    n = n + 1
+    if n > Config.GC_SCAN_CAP then break end
+    if type(obj) == "table" then
+      local src = rawget(obj, "Src")
+      if type(src) == "string" and not Buffs[src] then
+        local startTime = rawget(obj, "Start")
+        local dur = rawget(obj, "Dur")
+        if type(startTime) == "number" and type(dur) == "number" and rawget(obj, "Removed") ~= true then
+          local left = startTime + dur - now
+          if left > 0 then
+            Buffs[src] = { combo = rawget(obj, "Combo"), start = now - (dur - left), dur = dur }
+          end
+        end
+      end
+      if type(rawget(obj, "SlotId")) == "number" and type(rawget(obj, "SetCooldown")) == "function" then
+        local def = rawget(obj, "BuffDef")
+        if type(def) == "table" then
+          local name = rawget(obj, "Buff") or rawget(def, "Name") or ""
+          local icon = rawget(def, "Icon")
+          if type(name) == "string" then
+            rememberBeamIcon(name, icon)
+            if name == "Precision" then IconMap.precision = icon end
+          end
+        end
+        if rawget(obj, "Buff") == "Precision" and not seenPrecisionSlot then
+          seenPrecisionSlot = true
+          local c = rawget(obj, "Combo")
+          if type(c) == "number" and c > 0 and not Buffs["Precision"] then
+            local b = { fromSlot = true, combo = c }
+            local left = probeSlotTimer(obj)
+            if left then
+              b.start = now + left - Config.PRECISION_DUR
+              b.dur = Config.PRECISION_DUR
+            end
+            Buffs["Precision"] = b
+          elseif (c == nil or c == 0) then
+            local b = Buffs["Precision"]
+            if b and b.fromSlot then Buffs["Precision"] = nil end
+          end
+        end
+      end
+      if not regXf then
+        local xf = rawget(obj, "X-Flame")
+        if type(xf) == "table" and type(rawget(xf, "Values")) == "table" and type(rawget(xf.Values, 1)) == "number" then
+          regXf = xf.Values[1]
+        end
+      end
+      if not regSc then
+        local ss = rawget(obj, "Scorching Star")
+        if type(ss) == "table" and type(rawget(ss, "Values")) == "table" and type(rawget(ss.Values, 1)) == "number" then
+          regSc = ss.Values[1]
+        end
+      end
+      if rawget(obj, "flame") == true and #newFlames < 300 then
+        local v = rawget(obj, "v")
+        if typeof(v) == "Instance" and v:IsA("BasePart") and v.Parent and not flameSet[v] then
+          flameSet[v] = true
+          newFlames[#newFlames + 1] = v
+        end
+      end
+    end
+  end
+  flameParts = newFlames
+
+  if Counters.xflame == nil and regXf and not Calib.xf.offset then
+    if calibrate("xf", regXf, Config.XFLAME_MAX, false) then
+      applyDerived("xf", CounterTrack.xf, Config.XFLAME_MAX)
+    end
+  end
+  if Counters.scorch == nil and regSc and not Calib.sc.offset then
+    if calibrate("sc", regSc, Config.SCORCH_MAX, false) then
+      applyDerived("sc", CounterTrack.sc, Config.SCORCH_MAX)
+    end
+  end
+end
+
+-- ================= DATA =================
+local function buffLeft(src)
+  local b = Buffs[src]
+  if not b or type(b.start) ~= "number" or type(b.dur) ~= "number" then return nil end
+  return math.max(0, b.start + b.dur - os.time())
+end
+
+local Data = {
+  precision = { stacks = 0, secs = nil, source = nil },
+  scorch = { active = nil, untilN = nil, got = nil, mult = nil, links = nil },
+  xflame = { untilN = nil, got = nil },
+  morph = { stacks = 0, names = {}, secs = nil, bear = nil },
+  petals = { stacks = 0, secs = nil, mult = nil, srcName = nil },
+  flames = { count = 0, nearest = nil, fuel = nil },
+}
+
+local function readAll()
+  local nowClock = os.clock()
+  local nowTime = os.time()
+  local char = player.Character
+
+  for src, b in pairs(Buffs) do
+    if not b.fromSlot and not b.fromGui and type(b.start) == "number" and type(b.dur) == "number" and b.start + b.dur - nowTime <= 0 then
+      Buffs[src] = nil
+    end
+  end
+
+  local p = Buffs["Precision"]
+  Data.precision.stacks = (p and type(p.combo) == "number") and p.combo or 0
+  Data.precision.secs = buffLeft("Precision")
+  Data.precision.source = p and (p.fromGui and "gui" or (p.fromSlot and "slot" or "stream")) or nil
+
+  local pe = Buffs["Red Petal"]
+  local petalSrc = pe and "Red Petal" or nil
+  if not pe and Config.PETAL_FALLBACK then
+    local candidates = {}
+    for src, b in pairs(Buffs) do
+      if #src > 6 and src:sub(-6) == " Petal" and type(b.combo) == "number" and b.combo > 0 then
+        candidates[#candidates + 1] = src
+      end
+    end
+    table.sort(candidates)
+    if candidates[1] then
+      petalSrc = candidates[1]
+      pe = Buffs[candidates[1]]
+    end
+  end
+  Data.petals.stacks = (pe and type(pe.combo) == "number") and pe.combo or 0
+  Data.petals.secs = (pe and type(pe.start) == "number" and type(pe.dur) == "number")
+    and math.max(0, pe.start + pe.dur - nowTime) or nil
+  Data.petals.srcName = petalSrc
+  Data.petals.mult = Data.petals.stacks > 0 and math.min(2, 1.25 + 0.007576 * (Data.petals.stacks - 1)) or nil
+
+  local mv = char and char:FindFirstChild("Morph")
+  local bearName = nil
+  if mv and mv:IsA("ObjectValue") and mv.Value then
+    bearName = tostring(mv.Value.Name)
+  end
+  local names, stacks, secs = {}, 0, nil
+  for src, b in pairs(Buffs) do
+    if #src > 6 and src:sub(-6) == " Morph" and src:find("Bear", 1, true) then
+      local l = (type(b.start) == "number" and type(b.dur) == "number") and (b.start + b.dur - nowTime) or nil
+      if l and l > 0 then
+        stacks = stacks + 1
+        names[#names + 1] = src:sub(1, #src - 6)
+        if not secs or l > secs then secs = l end
+      elseif l == nil and not b.fromSlot and not b.fromGui and bearName and bearName == src:sub(1, #src - 6) then
+        stacks = stacks + 1
+        names[#names + 1] = bearName
+      end
+    end
+  end
+  if stacks == 0 and bearName then
+    stacks = 1
+    names[1] = bearName
+  end
+  Data.morph.stacks = stacks
+  Data.morph.names = names
+  Data.morph.secs = secs
+  Data.morph.bear = bearName
+
+  local auraB = Buffs["Scorching Star Aura"]
+  if not auraB then
+    for src, b in pairs(Buffs) do
+      if #src > 10 and src:sub(-10) == " Star Aura" then auraB = b break end
+    end
+  end
+  local d = Data.scorch
+  d.active = nil
+  if auraB and type(auraB.start) == "number" and type(auraB.dur) == "number" then
+    local l = auraB.start + auraB.dur - nowTime
+    if l > 0 then
+      d.active = l
+      local c = type(auraB.combo) == "number" and auraB.combo or 0
+      d.mult = math.min(5, 2 + 0.012048 * c)
+      d.links = math.floor(5 + 0.1005 * c)
+    end
+  end
+  d.untilN, d.got = counterUntil(CounterTrack.sc, Counters.scorch, Config.SCORCH_MAX)
+
+  Data.xflame.untilN, Data.xflame.got = counterUntil(CounterTrack.xf, Counters.xflame, Config.XFLAME_MAX)
+  if xfPrevUntil and Data.xflame.untilN and xfPrevUntil <= 2 and Data.xflame.untilN >= (Config.XFLAME_MAX - 3) then
+    xfBurstUntil = os.clock() + 1.6
+  end
+  xfPrevUntil = Data.xflame.untilN
+
+  local fuelLeft = buffLeft("Flame Fuel")
+  Data.flames.fuel = fuelLeft
+  local life = Config.FLAME_LIFETIME * (fuelLeft and Config.FUEL_MULT or 1)
+  local root = char and char:FindFirstChild("HumanoidRootPart")
+  local nowBurst = nowClock < xfBurstUntil
+  local list = {}
+  for _, part in ipairs(allFlameParts()) do
+    local dist = root and (part.Position - root.Position).Magnitude or 9999
+    local nm = tostring(part.Name):lower()
+    local namedXf = nm:find("xflame", 1, true) or nm:find("x-flame", 1, true) or nm:find("cross", 1, true)
+    if not xfTagged[part] and (nowBurst or namedXf) then
+      xfTagged[part] = nowClock
+    end
+    if dist <= Config.FLAME_RADIUS and isOwnFlame(part) then
+      if not flameFirstSeen[part] then flameFirstSeen[part] = nowClock end
+      local remain = life - (nowClock - flameFirstSeen[part])
+      if remain > 0 then
+        list[#list + 1] = { remain = remain, dist = dist }
+      end
+    end
+  end
+  for part in pairs(flameFirstSeen) do
+    if not part.Parent then flameFirstSeen[part] = nil end
+  end
+  for part in pairs(xfTagged) do
+    if not part.Parent then xfTagged[part] = nil end
+  end
+  table.sort(list, function(a, b) return a.dist < b.dist end)
+  Data.flames.count = #list
+  Data.flames.nearest = list[1]
+
+  for id, t in pairs(Tokens) do
+    if t.expires < nowTime then Tokens[id] = nil end
+  end
+end
+
+-- ================= GUI KIT =================
+local gui = Instance.new("ScreenGui")
+gui.Name = "BuffTools"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+if syn and syn.protect_gui then pcall(function() syn.protect_gui(gui) end) end
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local function corner(p, r) local c = Instance.new("UICorner", p) c.CornerRadius = UDim.new(0, r or 8) return c end
+local function circle(p)
+  local c = Instance.new("UICorner", p)
+  c.CornerRadius = UDim.new(1, 0)
+  return c
+end
+local function outline(p, color, tr)
+  local s = Instance.new("UIStroke", p)
+  s.Color = color or Theme.stroke
+  s.Thickness = 1
+  s.Transparency = tr or 0.3
+  return s
+end
+
+local function savePositions()
+  if not canSave then return end
+  local pos = {}
+  for _, t in ipairs(gui:GetChildren()) do
+    if t:GetAttribute("BTTile") then
+      pos[t.Name] = { x = t.Position.X.Offset, y = t.Position.Y.Offset, sx = t.Position.X.Scale, sy = t.Position.Y.Scale }
+    end
+  end
+  pcall(function() writefile(Config.SAVE_FILE, HttpService:JSONEncode(pos)) end)
+end
+
+local function loadPositions()
+  if not canSave then return {} end
+  local ok2, res = pcall(function()
+    if isfile(Config.SAVE_FILE) then
+      return HttpService:JSONDecode(readfile(Config.SAVE_FILE))
+    end
+  end)
+  return (ok2 and type(res) == "table") and res or {}
+end
+local savedPos = loadPositions()
+
+local function makeDraggable(frame)
+  local dragging, start, startPos
+  frame.InputBegan:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+      dragging, start, startPos = true, inp.Position, frame.Position
+      inp.Changed:Connect(function()
+        if inp.UserInputState == Enum.UserInputState.End and dragging then
+          dragging = false
+          savePositions()
+        end
+      end)
+    end
+  end)
+  UIS.InputChanged:Connect(function(inp)
+    if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+      local dd = inp.Position - start
+      local cam = currentCamera()
+      local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+      local x = math.clamp(startPos.X.Offset + dd.X, 0, math.max(0, vp.X - frame.AbsoluteSize.X))
+      local y = math.clamp(startPos.Y.Offset + dd.Y, 0, math.max(0, vp.Y - frame.AbsoluteSize.Y))
+      frame.Position = UDim2.new(startPos.X.Scale, x, startPos.Y.Scale, y)
+    end
+  end)
+end
+
+local function makeDraggableClickable(frame, onClick)
+  local dragging, start, startPos, moved
+  frame.InputBegan:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+      dragging, start, startPos, moved = true, inp.Position, frame.Position, 0
+    end
+  end)
+  UIS.InputChanged:Connect(function(inp)
+    if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+      local dd = inp.Position - start
+      moved = math.max(moved, math.abs(dd.X) + math.abs(dd.Y))
+      local cam = currentCamera()
+      local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+      local x = math.clamp(startPos.X.Offset + dd.X, 0, math.max(0, vp.X - frame.AbsoluteSize.X))
+      local y = math.clamp(startPos.Y.Offset + dd.Y, 0, math.max(0, vp.Y - frame.AbsoluteSize.Y))
+      frame.Position = UDim2.new(startPos.X.Scale, x, startPos.Y.Scale, y)
+    end
+  end)
+  frame.InputEnded:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+      dragging = false
+      if moved < 7 then onClick() end
+      savePositions()
+    end
+  end)
+end
+
+local function addStroke(lbl)
+  lbl.TextStrokeTransparency = 0.35
+  lbl.TextStrokeColor3 = Color3.fromRGB(8, 0, 6)
+end
+
+local function smallBtn(parent, text, w)
+  local b = Instance.new("TextButton")
+  b.Size = UDim2.fromOffset(w, 28)
+  b.BackgroundColor3 = Color3.fromRGB(16, 4, 14)
+  b.BackgroundTransparency = 0.25
+  b.Text = text
+  b.TextColor3 = Theme.text
+  b.Font = Enum.Font.GothamMedium
+  b.TextSize = 12
+  b.BorderSizePixel = 0
+  b.AutoButtonColor = true
+  b.Parent = parent
+  corner(b, 4)
+  local s = outline(b, Color3.fromRGB(90, 30, 70), 0.55)
+  s.Thickness = 1
+  return b
+end
+
+local function sectionLbl(parent, text, y)
+  local l = Instance.new("TextLabel")
+  l.Size = UDim2.new(1, 0, 0, 14)
+  l.Position = UDim2.fromOffset(2, y)
+  l.BackgroundTransparency = 1
+  l.Text = text
+  l.TextColor3 = Theme.muted
+  l.Font = Enum.Font.GothamBold
+  l.TextSize = 10
+  l.TextXAlignment = Enum.TextXAlignment.Left
+  l.Parent = parent
+  return l
+end
+
+-- ================= TILES =================
+local TILE_STYLE = {
+  precision = { glyph = "P",  color = Color3.fromRGB(168, 85, 247), title = "PRECISION", file = PACK.precision, rbx = "8172818074" },
+  scorch    = { glyph = "SS", color = Color3.fromRGB(220, 40, 55),  title = "SCORCHING STAR", file = PACK.scorch, rbx = nil },
+  xflame    = { glyph = "XF", color = Color3.fromRGB(255, 70, 60),   title = "X-FLAME", file = PACK.xflame, rbx = nil },
+  morph     = { glyph = "M",  color = Color3.fromRGB(176, 70, 220),  title = "BEAR MORPH", file = PACK.panda, rbx = "1472580249" },
+  petals    = { glyph = "RP", color = Color3.fromRGB(232, 72, 140),  title = "RED PETALS", file = PACK.petals, rbx = nil },
+}
+
+local Tiles = {}
+
+local function makeTile(id, index)
+  local st = TILE_STYLE[id]
+  local f = Instance.new("Frame")
+  f.Name = id
+  f:SetAttribute("BTTile", true)
+  f.Size = UDim2.fromOffset(196, 58)
+  local p = savedPos[id]
+  f.Position = p and UDim2.new(p.sx or 0, p.x, p.sy or 0, p.y) or UDim2.fromOffset(16, 60 + (index - 1) * 64)
+  f.BackgroundTransparency = 1
+  f.BorderSizePixel = 0
+  f.Parent = gui
+  makeDraggable(f)
+
+  local badge = Instance.new("Frame")
+  badge.Size = UDim2.fromOffset(34, 34)
+  badge.Position = UDim2.new(0, 0, 0, 8)
+  badge.BackgroundTransparency = 1
+  badge.BorderSizePixel = 0
+  badge.Parent = f
+
+  local img = Instance.new("ImageLabel")
+  img.Size = UDim2.fromScale(1, 1)
+  img.BackgroundTransparency = 1
+  img.ScaleType = Enum.ScaleType.Fit
+  img.Image = btAsset(st.file, st.rbx)
+  img.Parent = badge
+
+  if img.Image == "" then
+    local glyph = Instance.new("TextLabel")
+    glyph.Size = UDim2.fromScale(1, 1)
+    glyph.BackgroundTransparency = 1
+    glyph.Text = st.glyph
+    glyph.TextColor3 = st.color
+    glyph.Font = Enum.Font.GothamBlack
+    glyph.TextSize = 14
+    glyph.Parent = badge
+    addStroke(glyph)
+  end
+
+  local titleL = Instance.new("TextLabel")
+  titleL.Size = UDim2.new(1, -42, 0, 12)
+  titleL.Position = UDim2.new(0, 40, 0, 4)
+  titleL.BackgroundTransparency = 1
+  titleL.Text = st.title
+  titleL.TextColor3 = Color3.fromRGB(210, 190, 215)
+  titleL.Font = Enum.Font.GothamMedium
+  titleL.TextSize = 10
+  titleL.TextXAlignment = Enum.TextXAlignment.Left
+  titleL.Parent = f
+  addStroke(titleL)
+
+  local value = Instance.new("TextLabel")
+  value.Size = UDim2.new(1, -42, 0, 22)
+  value.Position = UDim2.new(0, 40, 0, 16)
+  value.BackgroundTransparency = 1
+  value.Text = "—"
+  value.TextColor3 = Theme.text
+  value.Font = Enum.Font.GothamBold
+  value.TextSize = 18
+  value.TextXAlignment = Enum.TextXAlignment.Left
+  value.Parent = f
+  addStroke(value)
+
+  local sub = Instance.new("TextLabel")
+  sub.Size = UDim2.new(1, -42, 0, 12)
+  sub.Position = UDim2.new(0, 40, 0, 38)
+  sub.BackgroundTransparency = 1
+  sub.Text = ""
+  sub.TextColor3 = Color3.fromRGB(180, 160, 185)
+  sub.Font = Enum.Font.Gotham
+  sub.TextSize = 10
+  sub.TextXAlignment = Enum.TextXAlignment.Left
+  sub.Parent = f
+  addStroke(sub)
+
+  local bar = Instance.new("Frame")
+  bar.Size = UDim2.new(0, 0, 0, 2)
+  bar.Position = UDim2.new(0, 40, 1, -4)
+  bar.BackgroundColor3 = st.color
+  bar.BorderSizePixel = 0
+  bar.Parent = f
+
+  Tiles[id] = { frame = f, value = value, sub = sub, bar = bar, style = st, img = img }
+end
+
+local order = { "precision", "scorch", "xflame", "morph", "petals" }
+for i, id in ipairs(order) do makeTile(id, i) end
+
+-- ================= BT TOGGLE =================
+local toggle = Instance.new("TextButton")
+toggle.Name = "__toggle"
+toggle:SetAttribute("BTTile", true)
+toggle.Size = UDim2.fromOffset(46, 46)
+local tp = savedPos["__toggle"]
+toggle.Position = tp and UDim2.new(tp.sx or 0, tp.x, tp.sy or 0, tp.y) or UDim2.new(0, 18, 0.55, -23)
+toggle.BackgroundColor3 = Color3.fromRGB(10, 2, 8)
+toggle.BackgroundTransparency = 1
+toggle.Text = ""
+toggle.AutoButtonColor = false
+toggle.BorderSizePixel = 0
+toggle.Parent = gui
+circle(toggle)
+outline(toggle, Color3.fromRGB(200, 36, 52), 0.35)
+
+local maskImg = Instance.new("ImageLabel")
+maskImg.Size = UDim2.fromScale(1, 1)
+maskImg.BackgroundTransparency = 1
+maskImg.ScaleType = Enum.ScaleType.Fit
+maskImg.Image = btAsset(PACK.mask, nil)
+maskImg.Parent = toggle
+
+-- ================= HUB =================
+local hub = Instance.new("Frame")
+hub.Name = "__hub"
+hub:SetAttribute("BTTile", true)
+hub.Size = UDim2.fromOffset(280, 128)
+local hp = savedPos["__hub"]
+hub.Position = hp and UDim2.new(hp.sx or 0, hp.x, hp.sy or 0, hp.y) or UDim2.new(0, 76, 0.55, -64)
+hub.BackgroundColor3 = Color3.fromRGB(8, 2, 8)
+hub.BackgroundTransparency = 0.18
+hub.BorderSizePixel = 0
+hub.Visible = false
+hub.ClipsDescendants = true
+hub.Parent = gui
+corner(hub, 8)
+outline(hub, Color3.fromRGB(70, 22, 58), 0.4)
+local hubScale = Instance.new("UIScale")
+hubScale.Scale = 1
+hubScale.Parent = hub
+makeDraggable(hub)
+
+local hubHeader = Instance.new("Frame")
+hubHeader.Size = UDim2.new(1, 0, 0, 40)
+hubHeader.BackgroundTransparency = 1
+hubHeader.BorderSizePixel = 0
+hubHeader.Parent = hub
+
+local hubRule = Instance.new("Frame")
+hubRule.Size = UDim2.new(1, -24, 0, 1)
+hubRule.Position = UDim2.fromOffset(12, 40)
+hubRule.BackgroundColor3 = Color3.fromRGB(200, 40, 60)
+hubRule.BackgroundTransparency = 0.35
+hubRule.BorderSizePixel = 0
+hubRule.Parent = hub
+
+local hubTitle = Instance.new("TextLabel")
+hubTitle.Size = UDim2.new(1, -70, 1, 0)
+hubTitle.Position = UDim2.fromOffset(14, 0)
+hubTitle.BackgroundTransparency = 1
+hubTitle.Text = "BUFFTOOLS"
+hubTitle.TextColor3 = Color3.fromRGB(255, 82, 92)
+hubTitle.Font = Enum.Font.GothamBold
+hubTitle.TextSize = 14
+hubTitle.TextXAlignment = Enum.TextXAlignment.Left
+hubTitle.Parent = hubHeader
+addStroke(hubTitle)
+
+local hubDot = Instance.new("Frame")
+hubDot.Size = UDim2.fromOffset(7, 7)
+hubDot.Position = UDim2.new(1, -62, 0.5, -3)
+hubDot.BackgroundColor3 = Theme.ok
+hubDot.BorderSizePixel = 0
+hubDot.Parent = hubHeader
+circle(hubDot)
+
+local btnCollapse = Instance.new("TextButton")
+btnCollapse.Size = UDim2.fromOffset(28, 22)
+btnCollapse.Position = UDim2.new(1, -40, 0.5, -11)
+btnCollapse.BackgroundTransparency = 1
+btnCollapse.Text = "×"
+btnCollapse.TextColor3 = Color3.fromRGB(200, 170, 185)
+btnCollapse.Font = Enum.Font.GothamBold
+btnCollapse.TextSize = 16
+btnCollapse.BorderSizePixel = 0
+btnCollapse.Parent = hubHeader
+
+local hubStatus = Instance.new("TextLabel")
+hubStatus.Size = UDim2.new(1, -24, 0, 14)
+hubStatus.Position = UDim2.fromOffset(14, 48)
+hubStatus.BackgroundTransparency = 1
+hubStatus.Text = ""
+hubStatus.TextColor3 = Color3.fromRGB(170, 150, 175)
+hubStatus.Font = Enum.Font.Gotham
+hubStatus.TextSize = 10
+hubStatus.TextXAlignment = Enum.TextXAlignment.Left
+hubStatus.Parent = hub
+
+sectionLbl(hub, "HUD", 70)
+
+local btnHideTiles = smallBtn(hub, "Hide HUD (RShift)", 256)
+btnHideTiles.Position = UDim2.fromOffset(12, 88)
+
+local hubHint = Instance.new("TextLabel")
+hubHint.Size = UDim2.new(1, -24, 0, 16)
+hubHint.Position = UDim2.fromOffset(14, 120)
+hubHint.BackgroundTransparency = 1
+hubHint.Text = "X-Flame timers on the field"
+hubHint.TextColor3 = Color3.fromRGB(150, 130, 155)
+hubHint.Font = Enum.Font.Gotham
+hubHint.TextSize = 10
+hubHint.TextXAlignment = Enum.TextXAlignment.Left
+hubHint.TextWrapped = true
+hubHint.Parent = hub
+
+-- ================= RENDER =================
+local function renderTiles()
+  do
+    local d, t = Data.precision, Tiles.precision
+    local vs = tostring(math.floor(d.stacks)) .. "/10"
+    if d.secs then vs = vs .. " · " .. tostring(math.ceil(d.secs)) .. "s" end
+    t.value.Text = vs
+    local sub = "+" .. tostring(math.floor(d.stacks) * 2) .. "% super-crit"
+    if d.source == "gui" then sub = sub .. " [icon]"
+    elseif d.source == "slot" then sub = sub .. " [slot]" end
+    t.sub.Text = sub
+    t.bar.Size = UDim2.new(math.clamp(d.stacks / 10, 0, 1), 0, 0, 2)
+    t.value.TextColor3 = d.stacks >= 10 and Theme.hot or Theme.text
+  end
+  do
+    local d, t = Data.scorch, Tiles.scorch
+    if d.active then
+      t.value.Text = tostring(math.ceil(d.active)) .. "s"
+      t.sub.Text = string.format("BURNING x%.2f red · %d links", d.mult or 2, d.links or 5)
+      t.bar.Size = UDim2.new(math.clamp(d.active / 45, 0, 1), 0, 0, 2)
+      t.value.TextColor3 = Color3.fromRGB(255, 90, 50)
+    elseif d.untilN then
+      t.value.Text = tostring(math.floor(d.untilN)) .. " left"
+      t.sub.Text = string.format("to star · got %d/%d", math.floor(d.got), Config.SCORCH_MAX)
+      t.bar.Size = UDim2.new(math.clamp(d.got / Config.SCORCH_MAX, 0, 1), 0, 0, 2)
+      t.value.TextColor3 = d.untilN <= 3 and Theme.hot or Theme.text
+    else
+      t.value.Text = "…"
+      t.sub.Text = Streams.tokens and "waiting for boost tokens..." or "no token stream"
+      t.bar.Size = UDim2.new(0, 0, 0, 2)
+    end
+  end
+  do
+    local d, t = Data.xflame, Tiles.xflame
+    if d.untilN then
+      t.value.Text = tostring(math.floor(d.untilN)) .. " left"
+      t.sub.Text = string.format("to proc · got %d/%d", math.floor(d.got), Config.XFLAME_MAX)
+      t.bar.Size = UDim2.new(math.clamp(d.got / Config.XFLAME_MAX, 0, 1), 0, 0, 2)
+      t.value.TextColor3 = d.untilN <= 3 and Theme.hot or Theme.text
+    else
+      t.value.Text = "…"
+      t.sub.Text = Streams.tokens and "waiting for battle tokens..." or "no token stream"
+      t.bar.Size = UDim2.new(0, 0, 0, 2)
+    end
+  end
+  do
+    local d, t = Data.morph, Tiles.morph
+    if d.stacks > 0 then
+      if d.secs then
+        t.value.Text = "x" .. tostring(d.stacks) .. " · " .. tostring(math.ceil(d.secs)) .. "s"
+        t.bar.Size = UDim2.new(math.clamp(d.secs / 30, 0, 1), 0, 0, 2)
+      else
+        t.value.Text = "x" .. tostring(d.stacks) .. " · active"
+        t.bar.Size = UDim2.new(1, 0, 0, 2)
+      end
+      local nm = #d.names > 0 and table.concat(d.names, "+") or (d.bear or "morph")
+      t.sub.Text = nm
+      t.value.TextColor3 = Color3.fromRGB(176, 70, 220)
+    else
+      local iv = MorphTrack.avgInterval or 60
+      local since = MorphTrack.lastSpawn and (os.clock() - MorphTrack.lastSpawn) or nil
+      local eta = since and math.max(0, iv - since) or nil
+      if eta then
+        t.value.Text = "~" .. tostring(math.ceil(eta)) .. "s"
+        t.sub.Text = "to token (pace " .. tostring(math.floor(iv)) .. "s)"
+        t.bar.Size = UDim2.new(math.clamp(since / iv, 0, 1), 0, 0, 2)
+      else
+        t.value.Text = "—"
+        t.sub.Text = "waiting for morph token..."
+        t.bar.Size = UDim2.new(0, 0, 0, 2)
+      end
+      t.value.TextColor3 = Theme.text
+    end
+    local morphHint = (d.names and d.names[1]) or d.bear
+    if t.img then
+      t.img.Image = btAsset(morphFileFromName(morphHint), "1472580249")
+    end
+  end
+  do
+    local d, t = Data.petals, Tiles.petals
+    local vs = tostring(math.floor(d.stacks)) .. "/100"
+    if d.secs then vs = vs .. " · " .. tostring(math.ceil(d.secs)) .. "s" end
+    t.value.Text = vs
+    local sub = d.mult and string.format("x%.2f red · +40%% UIC", d.mult) or "x1.25 red · +40% UIC"
+    if d.srcName and d.srcName ~= "Red Petal" then sub = sub .. " [" .. d.srcName .. "]" end
+    t.sub.Text = sub
+    t.bar.Size = UDim2.new(math.clamp(d.stacks / 100, 0, 1), 0, 0, 2)
+    local isRed = d.srcName == "Red Petal"
+    t.value.TextColor3 = (d.stacks > 0 and isRed) and Color3.fromRGB(255, 90, 110) or Theme.text
+  end
+end
+
+local function updateStatus()
+  hubStatus.Text = string.format("buffs %s · tokens %s · Precision %s",
+    Streams.buff and "ok" or "N/A", Streams.tokens and "ok" or "N/A",
+    Data.precision.stacks > 0 and (tostring(math.floor(Data.precision.stacks)) .. "/10") or "-")
+  hubDot.BackgroundColor3 = (Streams.buff and Streams.tokens) and Theme.ok or Theme.warn
+end
+
+-- ================= BEAMS (world-space, camera-stable) =================
+local beamPool = {}
+local BEAM_COLORS = {
+  morph = Color3.fromRGB(220, 40, 55),
+  inspire = Color3.fromRGB(160, 80, 255),
+  baby = Color3.fromRGB(220, 90, 180),
+  link = Color3.fromRGB(245, 240, 220),
+}
+local BEAM_HEIGHT = 72
+local BEAM_TEX = "rbxassetid://446111271"
+
+local beamFolder = Instance.new("Folder")
+beamFolder.Name = "BuffToolsBeams"
+pcall(function() beamFolder.Parent = Workspace end)
+
+local function makeWorldBeam(color, kind, tokenIcon, morphHint)
+  local holder = Instance.new("Part")
+  holder.Name = "BTBeam_" .. kind
+  holder.Anchored = true
+  holder.CanCollide = false
+  holder.CanQuery = false
+  holder.CanTouch = false
+  holder.CastShadow = false
+  holder.Transparency = 1
+  holder.Size = Vector3.new(0.2, 0.2, 0.2)
+  holder.Parent = beamFolder
+
+  local a0 = Instance.new("Attachment")
+  a0.Position = Vector3.new(0, 1.4, 0)
+  a0.Parent = holder
+  local a1 = Instance.new("Attachment")
+  a1.Position = Vector3.new(0, BEAM_HEIGHT, 0)
+  a1.Parent = holder
+
+  local function layer(w0, w1, trans, emit)
+    local b = Instance.new("Beam")
+    b.Attachment0 = a0
+    b.Attachment1 = a1
+    b.Color = ColorSequence.new(color)
+    b.Width0 = w0
+    b.Width1 = w1
+    b.Transparency = NumberSequence.new(trans)
+    b.LightEmission = emit
+    b.LightInfluence = 0
+    b.FaceCamera = true
+    b.Segments = 10
+    b.Texture = BEAM_TEX
+    b.TextureLength = 10
+    b.TextureSpeed = 0.4
+    b.TextureMode = Enum.TextureMode.Wrap
+    b.Parent = holder
+    return b
+  end
+  layer(7.5, 1.4, 0.38, 1)
+  layer(3.2, 0.45, 0.12, 1)
+  layer(1.1, 0.12, 0.02, 1)
+
+  local bb = Instance.new("BillboardGui")
+  bb.Name = "BTTokenHud"
+  bb.Size = UDim2.fromOffset(44, 58)
+  bb.StudsOffset = Vector3.new(0, 2.8, 0)
+  bb.AlwaysOnTop = true
+  bb.LightInfluence = 0
+  bb.MaxDistance = Config.BEAM_MAX_DIST + 80
+  bb.Parent = holder
+
+  local face = Instance.new("ImageLabel")
+  face.Size = UDim2.fromOffset(32, 32)
+  face.Position = UDim2.fromOffset(6, 0)
+  face.BackgroundTransparency = 1
+  face.ScaleType = Enum.ScaleType.Fit
+  face.Image = packIconForKind(kind, tokenIcon, morphHint)
+  face.Parent = bb
+
+  local timer = Instance.new("TextLabel")
+  timer.Size = UDim2.new(1, 0, 0, 18)
+  timer.Position = UDim2.fromOffset(0, 34)
+  timer.BackgroundTransparency = 1
+  timer.Font = Enum.Font.GothamBold
+  timer.TextSize = 14
+  timer.TextColor3 = Color3.fromRGB(255, 245, 250)
+  timer.Text = ""
+  timer.Parent = bb
+  addStroke(timer)
+
+  return { holder = holder, face = face, timer = timer, bb = bb, kind = kind }
+end
+
+local function setBeamVisible(bm, vis)
+  if not bm or not bm.holder then return end
+  for _, ch in ipairs(bm.holder:GetChildren()) do
+    if ch:IsA("Beam") then ch.Enabled = vis end
+  end
+  if bm.bb then bm.bb.Enabled = vis end
+end
+
+local function destroyBeam(bm)
+  if bm and bm.holder then
+    pcall(function() bm.holder:Destroy() end)
+  end
+end
+
+beamsOn = true
+
+local allHidden = false
+local xfHud = {}
+local function updateXfFieldHud()
+  local life = Config.FLAME_LIFETIME * (buffLeft("Flame Fuel") and Config.FUEL_MULT or 1)
+  local nowC = os.clock()
+  local seen = {}
+  if not allHidden then
+    for part, born in pairs(xfTagged) do
+      if part.Parent then
+        local remain = life - (nowC - born)
+        if remain > 0 then
+          seen[part] = true
+          local hud = xfHud[part]
+          if not hud then
+            local bb = Instance.new("BillboardGui")
+            bb.Name = "BTXfTimer"
+            bb.Size = UDim2.fromOffset(56, 24)
+            bb.StudsOffset = Vector3.new(0, 2.4, 0)
+            bb.AlwaysOnTop = true
+            bb.MaxDistance = 180
+            bb.Parent = part
+            local lab = Instance.new("TextLabel")
+            lab.Size = UDim2.fromScale(1, 1)
+            lab.BackgroundTransparency = 1
+            lab.Font = Enum.Font.GothamBlack
+            lab.TextSize = 16
+            lab.TextColor3 = Color3.fromRGB(255, 92, 48)
+            lab.Parent = bb
+            addStroke(lab)
+            hud = { bb = bb, lab = lab }
+            xfHud[part] = hud
+          end
+          hud.lab.Text = string.format("%.1fs", remain)
+          hud.bb.Enabled = true
+        end
+      end
+    end
+  end
+  for part, hud in pairs(xfHud) do
+    if not seen[part] then
+      pcall(function() hud.bb:Destroy() end)
+      xfHud[part] = nil
+    end
+  end
+end
+
+RunService.Heartbeat:Connect(function()
+  pcall(function()
+    if not beamsOn or next(Tokens) == nil then
+      if VisibleBeams ~= 0 then
+        for _, bm in pairs(beamPool) do setBeamVisible(bm, false) end
+        VisibleBeams = 0
+      end
+    else
+    local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if root then
+    local nowT = os.time()
+    local seen = {}
+    local visCount = 0
+    for id, info in pairs(Tokens) do
+      local kind = info.kind
+      if kind == "baby" or kind == "link" or kind == "inspire" or kind == "morph" then
+        local pos = info.pos
+        if info.part and info.part.Parent then
+          pos = info.part.Position
+          info.pos = pos
+        end
+        if pos and (pos - root.Position).Magnitude < Config.BEAM_MAX_DIST then
+          local bm = beamPool[id]
+          if not bm then
+            bm = makeWorldBeam(BEAM_COLORS[kind] or Theme.accent, kind, info.icon, info.morphName)
+            beamPool[id] = bm
+          elseif bm.kind ~= kind then
+            destroyBeam(bm)
+            bm = makeWorldBeam(BEAM_COLORS[kind] or Theme.accent, kind, info.icon, info.morphName)
+            beamPool[id] = bm
+          elseif bm.face then
+            bm.face.Image = packIconForKind(kind, info.icon, info.morphName)
+          end
+          bm.holder.CFrame = CFrame.new(pos)
+          local left = 0
+          if type(info.expires) == "number" then
+            left = math.max(0, info.expires - nowT)
+          end
+          if bm.timer then
+            bm.timer.Text = tostring(math.ceil(left)) .. "s"
+          end
+          setBeamVisible(bm, true)
+          visCount = visCount + 1
+          seen[id] = true
+        end
+      end
+    end
+    for id, bm in pairs(beamPool) do
+      if not seen[id] then
+        setBeamVisible(bm, false)
+        if not Tokens[id] then
+          destroyBeam(bm)
+          beamPool[id] = nil
+        end
+      end
+    end
+    VisibleBeams = visCount
+    end
+    end
+    updateXfFieldHud()
+  end)
+end)
+
+-- ================= HUB WIRING =================
+local hubOpen = false
+
+local function openHub()
+  hub.Visible = true
+  hubScale.Scale = 0.72
+  local tw = TweenService:Create(hubScale, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+  tw:Play()
+  updateStatus()
+end
+
+local function closeHub()
+  local tw = TweenService:Create(hubScale, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.8 })
+  tw:Play()
+  local conn
+  conn = tw.Completed:Connect(function()
+    conn:Disconnect()
+    if not hubOpen then
+      hub.Visible = false
+      hubScale.Scale = 1
+    end
+  end)
+end
+
+local function setTilesVisible(vis)
+  for _, id in ipairs(order) do
+    Tiles[id].frame.Visible = vis
+  end
+end
+
+local function toggleHub()
+  if allHidden then
+    allHidden = false
+    setTilesVisible(true)
+  end
+  hubOpen = not hubOpen
+  if hubOpen then openHub() else closeHub() end
+end
+
+makeDraggableClickable(toggle, toggleHub)
+
+btnCollapse.MouseButton1Click:Connect(function()
+  hubOpen = false
+  closeHub()
+end)
+
+btnHideTiles.MouseButton1Click:Connect(function()
+  allHidden = not allHidden
+  setTilesVisible(not allHidden)
+  if allHidden then
+    hubOpen = false
+    closeHub()
+  end
+  btnHideTiles.Text = allHidden and "Show HUD (RShift)" or "Hide HUD (RShift)"
+end)
+
+UIS.InputBegan:Connect(function(inp, processed)
+  if processed then return end
+  if inp.KeyCode == Enum.KeyCode.RightShift then
+    allHidden = not allHidden
+    setTilesVisible(not allHidden)
+    if allHidden then
+      hubOpen = false
+      closeHub()
+    end
+    btnHideTiles.Text = allHidden and "Show HUD (RShift)" or "Hide HUD (RShift)"
+  end
+end)
+
+-- ================= LOOP (performance-scheduled) =================
+local lastGui = 0
+local lastGc = 0
+local phaseStart = os.clock()
+
+-- initial scan right away (learning phase)
+task.spawn(function()
+  pcall(gcScan)
+end)
+
+task.spawn(function()
+  while gui.Parent do
+    local okLoop, errLoop = pcall(function()
+      local now = os.clock()
+
+      if now - lastGui >= Config.GUI_SCAN_INTERVAL then
+        lastGui = now
+        guiScan()
+      end
+
+      -- GC scans only while learning; then rare; then never
+      local learned = essentialsLearned()
+      local inLearnPhase = (now - phaseStart) < Config.LEARN_PHASE_TIME
+      local gcInterval = nil
+      if inLearnPhase then
+        gcInterval = Config.LEARN_SCAN_INTERVAL
+      elseif not learned then
+        gcInterval = Config.SLOW_SCAN_INTERVAL
+      end
+      if gcInterval and now - lastGc >= gcInterval then
+        lastGc = now
+        gcScan()
+      end
+
+      readAll()
+      scanWorldTokens()
+      reclassifyTokens()
+      renderTiles()
+      updateStatus()
+    end)
+    if not okLoop then
+      log("loop error:", errLoop)
+    end
+    task.wait(Config.POLL_INTERVAL)
+  end
+end)
+
+updateStatus()
+log("BuffTools v2.7 ready: performance build, no debug/remotes, learning-phase GC only.")
+
+end)
+
+if not btOk then btFatal(btErr) end

@@ -182,13 +182,17 @@ local Theme = {
   hot = Color3.fromRGB(255, 210, 140),
 }
 
--- Local PNG names from "pack icons bss". Copy that folder (or BuffTools/icons)
--- into the executor workspace. GitHub is not required.
+-- PNG names from pack. Downloaded from GitHub into executor cache, then getcustomasset.
+local ICON_CACHE_DIR = "BuffTools/icons/"
+local ICON_REMOTE_BASES = {
+  "https://cdn.jsdelivr.net/gh/webheartknight/bufftools@main/icons/",
+  "https://raw.githubusercontent.com/webheartknight/bufftools/main/icons/",
+}
 local ICON_PREFIXES = {
+  ICON_CACHE_DIR,
+  "BuffTools/icons\\",
   "pack icons bss/",
   "pack icons bss\\",
-  "BuffTools/icons/",
-  "BuffTools/icons\\",
   "",
 }
 
@@ -217,22 +221,87 @@ local function rbxUrl(id)
 end
 
 local customAssetCache = {}
+
+local function pngMagicOk(body)
+  return type(body) == "string" and #body > 64 and body:sub(1, 4) == "\137PNG"
+end
+
+local function httpGetBody(url)
+  local req = (syn and syn.request) or http_request or request or (http and http.request)
+  if req then
+    local ok, res = pcall(req, { Url = url, Method = "GET" })
+    if ok and type(res) == "table" then
+      local body = res.Body or res.body
+      local code = tonumber(res.StatusCode or res.status_code or res.Status)
+      if pngMagicOk(body) and (not code or code == 200) then
+        return body
+      end
+    end
+  end
+  local ok2, body2 = pcall(function()
+    return game:HttpGet(url)
+  end)
+  if ok2 and pngMagicOk(body2) then
+    return body2
+  end
+  return nil
+end
+
+local function fetchPackPng(filename)
+  local enc = filename:gsub(" ", "%%20")
+  for i = 1, #ICON_REMOTE_BASES do
+    local body = httpGetBody(ICON_REMOTE_BASES[i] .. enc)
+    if body then
+      return body
+    end
+  end
+  return nil
+end
+
+local function ensureIconCacheDir()
+  if type(makefolder) == "function" then
+    pcall(makefolder, "BuffTools")
+    pcall(makefolder, "BuffTools/icons")
+  end
+end
+
+local function tryCustom(path)
+  if type(getcustomasset) ~= "function" then
+    return nil
+  end
+  local ok, res = pcall(getcustomasset, path)
+  if ok and type(res) == "string" and res ~= "" then
+    return res
+  end
+  return nil
+end
+
 local function btAsset(filename, rbxFallback)
   if type(filename) == "string" and filename ~= "" then
     local cached = customAssetCache[filename]
-    if cached then
+    if type(cached) == "string" then
       return cached
-    elseif cached ~= false and type(getcustomasset) == "function" then
-      for i = 1, #ICON_PREFIXES do
-        local ok, res = pcall(getcustomasset, ICON_PREFIXES[i] .. filename)
-        if ok and type(res) == "string" and res ~= "" then
-          customAssetCache[filename] = res
-          return res
-        end
+    end
+    for i = 1, #ICON_PREFIXES do
+      local res = tryCustom(ICON_PREFIXES[i] .. filename)
+      if res then
+        customAssetCache[filename] = res
+        return res
       end
-      customAssetCache[filename] = false
-    elseif cached == nil then
-      customAssetCache[filename] = false
+    end
+    if type(isfile) ~= "function" or not isfile(ICON_CACHE_DIR .. filename) then
+      local body = fetchPackPng(filename)
+      if body then
+        ensureIconCacheDir()
+        pcall(function()
+          writefile(ICON_CACHE_DIR .. filename, body)
+        end)
+      end
+    end
+    local res = tryCustom(ICON_CACHE_DIR .. filename)
+    if res then
+      customAssetCache[filename] = res
+      return res
     end
   end
   return rbxUrl(rbxFallback)
@@ -306,6 +375,10 @@ local function packIconForKind(kind, tokenIcon, morphHint)
   if kind == "morph" then return btAsset(morphFileFromName(morphHint), "1472580249") end
   if kind == "link" then return btAsset(PACK.link, KNOWN_LINK_ID) end
   return ""
+end
+
+for _, filename in pairs(PACK) do
+  pcall(btAsset, filename, nil)
 end
 
 -- ================= STATE =================
