@@ -1,0 +1,20 @@
+---
+description: Always re-encrypt BuffTools.lua via encode_bt.py before shipping; never commit private source.
+alwaysApply: true
+---
+
+# BuffTools shipping encryption
+
+Readable source is `script.txt` (never commit). The public file is `BuffTools.lua`.
+
+Whenever the overlay changes (`script.txt`, loader, or anything that ships in BuffTools):
+
+1. Run `python encode_bt.py` from the repo root. Call the existing script as-is. Do not flatten, unwrap, or rewrite the Y/Z / stub encryption layers.
+2. Stage and commit **only** `BuffTools.lua` for overlay payload changes.
+3. Never commit `script.txt`, `encode_bt.py`, `decode_bt.py`, `_pack_locals.py`, or `bt2713.lua`. Never restore `bt2713.lua`.
+4. Do not use `git commit --no-verify`. The local pre-commit hook re-encodes and `git add BuffTools.lua`.
+5. Prefer `.\push_overlay.ps1 -Commit -Push` to encode, stage, commit, and push.
+
+Commit overlay updates with per-command identity only (never `git config`):
+
+`git -c user.name=webheartknight -c user.email=webheartknight@users.noreply.github.com commit ...`

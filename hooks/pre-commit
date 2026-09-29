@@ -1,0 +1,39 @@
+#!/bin/sh
+# Local/sample pre-commit: always re-encrypt BuffTools.lua via encode_bt.py.
+# Do not skip this hook. Do not flatten encryption layers.
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+if [ ! -f encode_bt.py ]; then
+	echo "pre-commit: encode_bt.py missing; cannot encrypt BuffTools.lua" >&2
+	exit 1
+fi
+
+if [ ! -f script.txt ]; then
+	echo "pre-commit: script.txt missing (readable source required)" >&2
+	exit 1
+fi
+
+if command -v python >/dev/null 2>&1; then
+	python encode_bt.py || exit 1
+elif command -v python3 >/dev/null 2>&1; then
+	python3 encode_bt.py || exit 1
+elif command -v py >/dev/null 2>&1; then
+	py -3 encode_bt.py || exit 1
+else
+	echo "pre-commit: python not found; cannot encrypt BuffTools.lua" >&2
+	exit 1
+fi
+
+git add -- BuffTools.lua || exit 1
+
+blocked="$(git diff --cached --name-only | grep -E '(^|/)(script\.txt|encode_bt\.py|decode_bt\.py|_pack_locals\.py|bt2713\.lua)$' || true)"
+if [ -n "$blocked" ]; then
+	echo "pre-commit: refusing to commit private/source files:" >&2
+	echo "$blocked" >&2
+	echo "Public ship file is BuffTools.lua only." >&2
+	exit 1
+fi
+
+exit 0
